@@ -489,3 +489,554 @@ Benefits:
 - Exit code `0` means success; non-zero means failure.
 - YAML relies on proper indentation using spaces.
 - DevOps is a culture that emphasizes collaboration, automation, and continuous delivery.
+
+- # GitLab CI/CD Notes
+
+## npm install vs npm ci
+
+| `npm install` | `npm ci` |
+|---------------|-----------|
+| Installs dependencies and may update `package-lock.json`. | Installs exactly what is in `package-lock.json`. |
+| Used during local development. | Used mainly in CI/CD pipelines. |
+| Faster than a fresh install, but can modify dependency versions. | Faster and more reliable because it performs a clean install. |
+| Keeps existing `node_modules` if possible. | Deletes `node_modules` before installing. |
+| Works even if `package-lock.json` is missing. | Requires `package-lock.json`; otherwise it fails. |
+
+### Why use `npm ci` in GitLab CI?
+
+- Ensures every pipeline uses the exact same dependency versions.
+- Prevents "works on my machine" issues.
+- Faster than `npm install`.
+- Makes builds reproducible.
+
+---
+
+# GitLab Architecture
+
+## GitLab Server
+
+The GitLab Server is responsible for:
+
+- Storing repositories
+- Managing Merge Requests
+- Managing Pipelines
+- Scheduling jobs
+- Assigning jobs to available GitLab Runners
+
+Think of it as the **manager** that distributes work.
+
+---
+
+## GitLab Runner
+
+GitLab Runner is responsible for:
+
+- Picking up jobs assigned by the GitLab Server
+- Running jobs inside Docker containers (or other executors)
+- Reporting the job result back to GitLab
+
+A runner can execute **multiple jobs in parallel** (depending on configuration). So if multiple pipelines are running, the runner can process several jobs simultaneously.
+
+---
+
+# Why Artifacts?
+
+Each GitLab job runs inside a **fresh container**.
+
+After the job finishes:
+
+- Container is destroyed
+- Temporary files are deleted
+
+Therefore, files created in one stage are **not available** in the next stage unless they are stored as **artifacts**.
+
+Example:
+
+```
+Build Stage
+    ↓
+build/
+index.html
+    ↓
+Artifact Uploaded
+    ↓
+Container Destroyed
+    ↓
+Test Stage
+    ↓
+Artifact Downloaded
+```
+
+Example:
+
+```yaml
+artifacts:
+  paths:
+    - build/
+```
+
+---
+
+# Relative Path vs Absolute Path
+
+Suppose the project structure is
+
+```
+project/
+│
+├── build/
+│   └── index.html
+├── src/
+└── package.json
+```
+
+### Relative Path
+
+```
+cd build
+```
+
+or
+
+```
+cd ./build
+```
+
+Both mean:
+
+> Go to the **build folder inside the current directory**.
+
+`./` means **current directory**.
+
+---
+
+### Absolute Path
+
+```
+cd /build
+```
+
+This means:
+
+> Go to the folder named `build` directly under the Linux root (`/`).
+
+```
+/
+├── bin
+├── etc
+├── home
+├── build   ← looks here
+```
+
+This is **not** your project folder.
+
+So when accessing GitLab artifacts, use **relative paths**, not `/build`.
+
+---
+
+# GitLab Default Stages
+
+GitLab automatically provides five stages.
+
+```text
+.pre
+build
+test
+deploy
+.post
+```
+
+If your job uses only these stage names, you **do not have to define** the `stages:` section.
+
+Example:
+
+```yaml
+build_app:
+  stage: build
+
+test_app:
+  stage: test
+```
+
+This works because GitLab already knows these stages.
+
+You only need to define `stages:` when:
+
+- changing the order
+- adding custom stages
+
+Example:
+
+```yaml
+stages:
+  - lint
+  - build
+  - test
+  - deploy
+```
+
+---
+
+# Example Pipeline
+
+```yaml
+stages:
+  - build
+  - test
+
+build_website:
+  image: node:22-alpine
+  stage: build
+
+  script:
+    - node --version
+    - npm --version
+    - npm ci
+    - ls -la
+    - npm run build
+    - ls -la
+
+  artifacts:
+    paths:
+      - build/
+
+test_website:
+  image: alpine
+  stage: test
+
+  script:
+    - test -f build/index.html
+
+unit_test:
+  image: node:22-alpine
+  stage: test
+
+  script:
+    - npm ci
+    - npm run test
+
+  artifacts:
+    when: always
+
+    reports:
+      junit: reports/junit.xml
+```
+
+---
+
+# JUnit Reports
+
+```yaml
+artifacts:
+  when: always
+  reports:
+    junit: reports/junit.xml
+```
+
+## `when: always`
+
+Normally, artifacts are uploaded **only if the job succeeds**.
+
+```
+Job Pass
+↓
+Upload Artifact
+```
+
+If the job fails:
+
+```
+Job Fail
+↓
+No Artifact
+```
+
+Using
+
+```yaml
+when: always
+```
+
+means artifacts are uploaded whether the job passes or fails.
+
+Useful for:
+
+- test reports
+- logs
+- screenshots
+- debugging failures
+
+---
+
+## reports
+
+```yaml
+reports:
+  junit: reports/junit.xml
+```
+
+This tells GitLab:
+
+> This artifact is a **JUnit test report**.
+
+GitLab parses the XML and displays:
+
+- Passed tests
+- Failed tests
+- Test duration
+- Test summary
+
+instead of only letting you download the XML.
+
+> **Note:** `reports:` artifacts are automatically treated as `when: always`, so explicitly writing `when: always` is optional.
+
+---
+
+# Recommended Merge Request Settings
+
+## 1. Branch Rule
+
+**Prevent direct pushes/merges to `main`.**
+
+### Why?
+
+The `main` branch should always remain stable and deployable.
+
+Developers work on feature branches:
+
+```
+main
+  │
+  ├── feature/login
+  ├── feature/payment
+  └── bugfix/navbar
+```
+
+Every change goes through:
+
+- Merge Request (MR)
+- Code Review
+- Automated Pipeline
+- Approval
+
+Only then is it merged into `main`.
+
+Benefits:
+
+- Prevents accidental mistakes.
+- Ensures code review.
+- Ensures all CI/CD checks pass.
+- Keeps production stable.
+
+---
+
+## 2. Merge Method: Fast-forward Merge
+
+### Why?
+
+Fast-forward merge keeps a **linear Git history**.
+
+Without fast-forward:
+
+```
+A---B------M
+     \    /
+      C--D
+```
+
+With fast-forward:
+
+```
+A---B---C---D
+```
+
+Benefits:
+
+- Cleaner history
+- Easier debugging with `git bisect`
+- Simpler `git log`
+- No unnecessary merge commits
+
+---
+
+## 3. Squash Commits When Merging
+
+Recommended setting:
+
+> **Encourage** (checkbox visible and selected by default)
+
+### Why?
+
+During development, developers often create many small commits:
+
+```
+fix typo
+again
+oops
+another fix
+final fix
+```
+
+Instead of polluting `main`, GitLab combines them into one meaningful commit:
+
+```
+Add Login Feature
+```
+
+Benefits:
+
+- Cleaner commit history
+- Easier to understand project changes
+- Simpler to revert a feature if needed
+
+---
+
+# Target Project in Merge Requests
+
+Suppose you have:
+
+```
+Upstream Project
+gitlab-course-public/learn-gitlab-app
+```
+
+and your own fork:
+
+```
+calsoft-group/learn-gitlab-app
+```
+
+GitLab asks where Merge Requests should go.
+
+### Upstream Project
+
+```
+gitlab-course-public/learn-gitlab-app
+```
+
+Use this when contributing changes back to the original project.
+
+### This Project
+
+```
+calsoft-group/learn-gitlab-app
+```
+
+Use this when your work is intended only for your own repository.
+
+In company projects, the default target is usually **This Project**, because team members collaborate within the same repository rather than submitting changes to an external upstream project.
+
+---
+
+# Always Create New Branches from `main`
+
+Good practice:
+
+```
+main
+│
+├── feature-login
+├── feature-payment
+├── feature-dashboard
+```
+
+Avoid creating branches from other feature branches:
+
+```
+feature-login
+      │
+      └── feature-payment
+```
+
+### Why?
+
+Creating every feature branch from the latest `main`:
+
+- reduces merge conflicts
+- keeps branches independent
+- makes reviews easier
+- avoids bringing unfinished work into new branches
+
+---
+
+# "Add Comment Now" vs "Start Review" in Merge Requests
+
+## Add Comment Now
+
+- Comment is posted immediately.
+- Suitable for one or two quick suggestions.
+
+Example:
+
+> Please rename this variable.
+
+---
+
+## Start Review
+
+Comments remain as drafts.
+
+You can add multiple comments across many files.
+
+When finished, click:
+
+```
+Submit Review
+```
+
+All comments are published together.
+
+Useful when performing a complete code review.
+
+---
+
+# Typical Company Git Workflow
+
+Most software companies **do not allow direct changes to the `main` branch**.
+
+Typical workflow:
+
+```
+Developer
+      │
+      ▼
+Create Feature Branch
+      │
+      ▼
+Write Code
+      │
+      ▼
+Commit Changes
+      │
+      ▼
+Push Branch
+      │
+      ▼
+Create Merge Request
+      │
+      ▼
+CI/CD Pipeline Runs
+      │
+      ├── Build
+      ├── Unit Tests
+      ├── Lint
+      ├── Security Checks
+      ▼
+Code Review
+      ▼
+Approvals
+      ▼
+Merge into main
+      ▼
+Deploy
+```
+
+### Why follow this process?
+
+- Prevents broken code from reaching `main`
+- Ensures automated tests pass
+- Enables code review
+- Maintains high code quality
+- Keeps the production branch stable
+
+This Git workflow is widely used in professional software development teams.
